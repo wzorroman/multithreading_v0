@@ -2,7 +2,7 @@
 # Este ejemplo muestra cómo combinar la eficiencia de asyncio para I/O con el 
 # poder de multiprocessing para CPU-bound tasks, implementando:
 
-# 1. Un servidor HTTP asíncrono que maneja múltiples solicitudes
+# 1. Un servidor HTTP asíncrono basado en 'aiohttp' que maneja múltiples solicitudes
 # 2. Un pool de procesos para tareas intensivas de CPU
 # 3. Comunicación bidireccional entre los procesos
 # 4. Sistema de colas para distribuir el trabajo
@@ -61,6 +61,7 @@ def process_worker(task_queue, result_queue, progress_queue):
 # Parte asíncrona (servidor web + coordinación)
 # =============================================
 async def start_process_pool(num_workers):
+    print(f"{num_workers=}")
     """Inicia el pool de procesos y las colas de comunicación"""
     task_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
@@ -83,6 +84,7 @@ async def start_process_pool(num_workers):
         'workers': workers
     }
 
+# ---------- Tareas en segundo plano ------------
 async def monitor_progress(app):
     """Corutina que monitorea el progreso y actualiza el estado"""
     while True:
@@ -100,9 +102,50 @@ async def monitor_progress(app):
                     app['tasks'][task_id]['partial_results'] = []
                 app['tasks'][task_id]['partial_results'].append(progress)
                 
-                print(f"Progreso actualizado: {task_id} - {progress['progress']:.1f}%")
+                print(f"  - Progreso actualizado: {task_id} - {progress['progress']:.1f}%")
         except:
             await asyncio.sleep(0.1)
+            
+async def background_result_processor(app):
+    """Procesa resultados finales en segundo plano"""
+    while True:
+        try:
+            result = app['result_queue'].get_nowait()
+            task_id = result['task_id']
+            
+            if task_id in app['tasks']:
+                app['tasks'][task_id].update(result)
+                app['tasks'][task_id]['end_time'] = time.time()
+                print(f"Tarea completada: {task_id}")
+        except:
+            await asyncio.sleep(0.5)
+
+# ------- Configuración de la aplicación --------
+async def startup(app):
+    """Configuración inicial de la aplicación"""
+    # Iniciar pool de procesos
+    pool = await start_process_pool(num_workers=multiprocessing.cpu_count())
+    app.update(pool)
+    app['tasks'] = {}
+    
+    # Iniciar tareas en segundo plano
+    app['progress_monitor'] = asyncio.create_task(monitor_progress(app))
+    app['result_processor'] = asyncio.create_task(background_result_processor(app))
+
+async def cleanup(app):
+    """Limpieza al cerrar la aplicación"""
+    # Detener monitores
+    app['progress_monitor'].cancel()
+    app['result_processor'].cancel()
+    
+    # Detener workers
+    for _ in range(len(app['workers'])):
+        app['task_queue'].put(None)
+    
+    for worker in app['workers']:
+        worker.join()
+
+# ---- Funciones de Rutas del servidor web ------
 
 async def handle_start_task(request):
     """Endpoint para iniciar una nueva tarea"""
@@ -157,44 +200,7 @@ async def handle_check_status(request):
     
     return web.json_response(task_data)
 
-async def background_result_processor(app):
-    """Procesa resultados finales en segundo plano"""
-    while True:
-        try:
-            result = app['result_queue'].get_nowait()
-            task_id = result['task_id']
-            
-            if task_id in app['tasks']:
-                app['tasks'][task_id].update(result)
-                app['tasks'][task_id]['end_time'] = time.time()
-                print(f"Tarea completada: {task_id}")
-        except:
-            await asyncio.sleep(0.5)
-
-async def startup(app):
-    """Configuración inicial de la aplicación"""
-    # Iniciar pool de procesos
-    pool = await start_process_pool(num_workers=multiprocessing.cpu_count())
-    app.update(pool)
-    app['tasks'] = {}
-    
-    # Iniciar tareas en segundo plano
-    app['progress_monitor'] = asyncio.create_task(monitor_progress(app))
-    app['result_processor'] = asyncio.create_task(background_result_processor(app))
-
-async def cleanup(app):
-    """Limpieza al cerrar la aplicación"""
-    # Detener monitores
-    app['progress_monitor'].cancel()
-    app['result_processor'].cancel()
-    
-    # Detener workers
-    for _ in range(len(app['workers'])):
-        app['task_queue'].put(None)
-    
-    for worker in app['workers']:
-        worker.join()
-
+# --------- Servidor web -------------
 def create_app():
     """Configura la aplicación web"""
     app = web.Application()
@@ -209,12 +215,12 @@ def create_app():
     return app
 
 # =============================================
-# Ejecución principal
+#  -- Ejecución principal  --
 # =============================================
 if __name__ == '__main__':
     # Configuración para sistemas Windows
-    if multiprocessing.get_start_method() == 'fork':
-        multiprocessing.set_start_method('spawn')
+    if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+        multiprocessing.set_start_method('spawn', force=True)
     
     # Iniciar servidor web
     web.run_app(create_app(), port=8080)
